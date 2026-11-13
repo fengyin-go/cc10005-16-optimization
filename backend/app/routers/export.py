@@ -1,65 +1,185 @@
-"""数据分发接口：维护分发通道，覆盖提交校验、启用通道、停用通道等动作。"""
+"""数据分发接口：交付信封封存、投递接收端、回执对账与补证。
+
+数据落盘确认后的批次是唯一可取内容；信封封存后摘要、编码、目标系统与通道身份即冻结。
+投递只在本地模拟接收端发生，交付结论一律以回执对账为准，发送端 200 不作为完成依据。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.export import ExportService
+from app.schemas import ActionResult, PageResult
+from app.services.export import (
+    ENCODINGS,
+    SIMULATIONS,
+    STAGE_ORDER,
+    STAGE_VERDICTS,
+    STATUSES,
+    service,
+)
 
 router = APIRouter(prefix="/api/export", tags=["数据分发"])
 
-service = ExportService()
 
-LIST_FIELDS = ["通道编号", "输出数据集", "目标系统", "分发格式", "传输协议", "频率控制", "加密开关", "完整性校验"]
-STATUSES = ["草稿", "待校验", "已启用", "已停用"]
+class SealRequest(BaseModel):
+    batch_id: int
+    channel_id: int
+    encoding: str = "UTF-8"
+    simulation: str = "正常签收"
+    sealed_by: str = "值班管理员"
 
 
-@router.get("", response_model=PageResult[dict])
-def list_entries(
-    keyword: str | None = Query(default=None, description="按通道编号检索"),
-    status: str | None = Query(default=None, description="草稿、待校验、已启用、已停用"),
+class OperatorRequest(BaseModel):
+    operator: str = "值班管理员"
+
+
+class ReceiptRequest(BaseModel):
+    stage: str
+    verdict: str
+    note: str = ""
+    source: str = "人工补录"
+    operator: str = "值班管理员"
+    attempt_no: int | None = None
+    channel_identity: str | None = None
+
+
+class AppendRequest(BaseModel):
+    rows: int = Field(default=2, ge=1, le=10)
+
+
+@router.get("/channels", response_model=PageResult[dict])
+def list_channels() -> PageResult[dict]:
+    """分发通道身份列表：信封的通道归属以这里的通道身份为准。"""
+    items = service.list_channels()
+    return PageResult(items=items, total=len(items), page=1, size=max(len(items), 1))
+
+
+@router.get("/batches", response_model=PageResult[dict])
+def list_batches() -> PageResult[dict]:
+    """可供封存的数据落盘确认批次。未确认批次不会出现在这里。"""
+    items = service.list_batches()
+    return PageResult(items=items, total=len(items), page=1, size=max(len(items), 1))
+
+
+@router.get("/stats", response_model=dict)
+def get_stats() -> dict[str, Any]:
+    """信封对账总览：各交付状态计数、尚缺证明的信封数与传输次数。"""
+    return service.stats()
+
+
+@router.get("/options", response_model=dict)
+def get_options() -> dict[str, Any]:
+    """封存与补录时可选的编码、演练场景、状态与证明阶段。"""
+    return {
+        "encodings": list(ENCODINGS),
+        "simulations": SIMULATIONS,
+        "statuses": STATUSES,
+        "stages": STAGE_ORDER,
+        "stage_verdicts": STAGE_VERDICTS,
+    }
+
+
+@router.get("/envelopes", response_model=PageResult[dict])
+def list_envelopes(
+    channel: str | None = Query(default=None, description="按通道身份或通道编号筛选"),
+    status: str | None = Query(default=None, description="按交付状态筛选"),
+    missing: str | None = Query(default=None, description="只保留尚缺某阶段证明的信封"),
+    sort: str = Query(default="stage_desc", description="time_desc、time_asc、stage_asc、stage_desc"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按通道编号与状态过滤数据分发列表；没有数据时返回空页，不报错。"""
+    """按通道、状态、缺失证明阶段筛选信封，并按时间或证明阶段排序。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    if missing and missing not in STAGE_ORDER:
+        raise HTTPException(status_code=400, detail=f"证明阶段「{missing}」不在 {'、'.join(STAGE_ORDER)} 之列")
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"交付状态「{status}」不在允许范围内")
+    if sort not in {"time_desc", "time_asc", "stage_asc", "stage_desc"}:
+        raise HTTPException(status_code=400, detail="排序方式只支持 time_desc、time_asc、stage_asc、stage_desc")
+    items, total = service.list_envelopes(
+        channel=channel, status=status, missing=missing, sort=sort, page=page, size=size
+    )
     return PageResult(items=items, total=total, page=page, size=size)
 
 
-@router.get("/{entry_id}", response_model=dict)
-def get_entry(entry_id: int) -> dict:
-    """读取单条分发通道明细；不存在时给出可读的错误说明。"""
-    entry = service.get_entry(entry_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"分发通道 {entry_id} 不存在或已归档")
-    return entry
-
-
-@router.post("", response_model=ActionResult)
-def create_entry(payload: EntryPayload) -> ActionResult:
-    """登记一条分发通道，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
-    return ActionResult(ok=True, message="分发通道已登记", entry=entry)
-
-
-@router.post("/{entry_id}/actions", response_model=ActionResult)
-def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条分发通道执行提交校验、启用通道、停用通道；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
-    if entry is None:
+@router.post("/envelopes", response_model=ActionResult)
+def seal_envelope(payload: SealRequest) -> ActionResult:
+    """从已确认落盘批次取内容封存信封；同一摘要沿用既有交付身份，不新增数据份数。"""
+    envelope, message, created = service.seal(
+        batch_id=payload.batch_id,
+        channel_id=payload.channel_id,
+        encoding=payload.encoding,
+        simulation=payload.simulation,
+        sealed_by=payload.sealed_by,
+    )
+    if envelope is None:
         return ActionResult(ok=False, message=message)
+    entry = service.detail(envelope)
+    entry["existing"] = not created
     return ActionResult(ok=True, message=message, entry=entry)
 
 
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出数据分发清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "export", "total": total, "items": items}
+@router.get("/envelopes/{envelope_id}", response_model=dict)
+def get_envelope(envelope_id: int) -> dict[str, Any]:
+    """信封明细：封存快照、传输记录、按阶段排列的回执与对账结论。"""
+    envelope = service.envelope_by_id(envelope_id)
+    if envelope is None:
+        raise HTTPException(status_code=404, detail=f"交付信封 {envelope_id} 不存在或已归档")
+    return service.detail(envelope)
+
+
+@router.post("/envelopes/{envelope_id}/send", response_model=ActionResult)
+def send_envelope(envelope_id: int, payload: OperatorRequest) -> ActionResult:
+    """向本地模拟接收端投递；重送保持摘要与交付身份不变，发送端 200 不代表交付完成。"""
+    envelope = service.envelope_by_id(envelope_id)
+    if envelope is None:
+        return ActionResult(ok=False, message=f"交付信封 {envelope_id} 不存在或已归档")
+    updated, message = service.send(envelope, payload.operator)
+    if updated is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=service.detail(updated))
+
+
+@router.post("/envelopes/{envelope_id}/supplement", response_model=ActionResult)
+def request_supplement(envelope_id: int, payload: OperatorRequest) -> ActionResult:
+    """凭原信封要求接收端补发缺失证明；拒收结论不可被补证推翻。"""
+    envelope = service.envelope_by_id(envelope_id)
+    if envelope is None:
+        return ActionResult(ok=False, message=f"交付信封 {envelope_id} 不存在或已归档")
+    updated, message = service.request_supplement(envelope, payload.operator)
+    if updated is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=service.detail(updated))
+
+
+@router.post("/envelopes/{envelope_id}/receipts", response_model=ActionResult)
+def record_receipt(envelope_id: int, payload: ReceiptRequest) -> ActionResult:
+    """补录一条指定阶段的回执；跨通道回执或迟到低阶段证明会被标出并排除在对账之外。"""
+    envelope = service.envelope_by_id(envelope_id)
+    if envelope is None:
+        return ActionResult(ok=False, message=f"交付信封 {envelope_id} 不存在或已归档")
+    updated, message = service.record_receipt(
+        envelope,
+        stage=payload.stage,
+        verdict=payload.verdict,
+        note=payload.note,
+        source=payload.source,
+        operator=payload.operator,
+        attempt_no=payload.attempt_no,
+        channel_identity=payload.channel_identity,
+    )
+    if updated is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=service.detail(updated))
+
+
+@router.post("/batches/{batch_id}/append", response_model=ActionResult)
+def append_batch(batch_id: int, payload: AppendRequest) -> ActionResult:
+    """演练用：往落盘批次追加内容，验证已封存信封的快照不随之变化。"""
+    entry, message = service.append_batch_rows(batch_id, payload.rows)
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
